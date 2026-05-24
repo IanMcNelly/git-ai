@@ -3529,13 +3529,21 @@ fn remove_pid_metadata(config: &DaemonConfig) -> Result<(), GitAiError> {
 /// for read-only lock checks.
 #[cfg(unix)]
 fn remove_stale_daemon_files(config: &DaemonConfig) {
+    let pid_path = pid_metadata_path(config);
     for path in [
-        &config.lock_path,
-        &config.control_socket_path,
-        &config.trace_socket_path,
-        &pid_metadata_path(config),
+        config.lock_path.as_path(),
+        config.control_socket_path.as_path(),
+        config.trace_socket_path.as_path(),
+        pid_path.as_path(),
     ] {
-        if path.exists() && std::fs::OpenOptions::new().write(true).open(path).is_err() {
+        let dominated_by_wrong_owner = match std::fs::metadata(path) {
+            Ok(meta) => {
+                use std::os::unix::fs::MetadataExt;
+                meta.uid() != unsafe { libc::getuid() }
+            }
+            Err(_) => false,
+        };
+        if dominated_by_wrong_owner {
             let _ = fs::remove_file(path);
         }
     }
