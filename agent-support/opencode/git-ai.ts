@@ -17,7 +17,7 @@
  * @see https://opencode.ai/docs/plugins/
  */
 
-import type { Plugin } from "@opencode-ai/plugin"
+import type { Plugin, PluginInput } from "@opencode-ai/plugin"
 import { spawn } from "child_process"
 import { existsSync, readFileSync, statSync } from "fs"
 import { dirname, isAbsolute, join, resolve } from "path"
@@ -162,6 +162,13 @@ const asRecord = (value: unknown): Record<string, unknown> | undefined => {
 
 const hookString = (value: unknown): string => typeof value === "string" ? value : ""
 
+const extractToolCwd = (inputCwd: unknown, args: Record<string, unknown> | undefined): string | undefined => {
+  if (typeof args?.workdir === "string") return args.workdir
+  if (typeof args?.cwd === "string") return args.cwd
+  if (typeof inputCwd === "string") return inputCwd
+  return undefined
+}
+
 const debugEnabled = (): boolean => {
   const value = process.env.GIT_AI_OPENCODE_DEBUG ?? process.env.GIT_AI_DEBUG
   return value === "1" || value?.toLowerCase() === "true"
@@ -257,7 +264,146 @@ const runCommand = (
   })
 }
 
+const hasShell = (value: unknown): value is PluginInput["$"] => typeof value === "function"
+
+const createShellHooks = async (shell: PluginInput["$"]) => {
+  try {
+    await shell`${GIT_AI_BIN} --version`.quiet()
+  } catch {
+    return {}
+  }
+
+  const pendingCalls = new Map<string, { repoDir: string; sessionID: string; toolInput: unknown }>()
+
+  const findGitRepo = async (pathHint: string): Promise<string | null> => {
+    const candidateDirs = [pathHint, dirname(pathHint)]
+
+    for (const dir of candidateDirs) {
+      try {
+        const result = await shell`git -C ${dir} rev-parse --show-toplevel`.quiet()
+        const repoRoot = result.stdout.toString().trim()
+        if (repoRoot) {
+          return repoRoot
+        }
+      } catch {
+        // try next candidate
+      }
+    }
+
+    return null
+  }
+
+  const resolveRepoDir = async (filePaths: string[], cwd?: string): Promise<string | null> => {
+    if (cwd) {
+      const fromCwd = await findGitRepo(cwd)
+      if (fromCwd) {
+        return fromCwd
+      }
+    }
+
+    const fromProcessCwd = await findGitRepo(process.cwd())
+    if (fromProcessCwd) {
+      return fromProcessCwd
+    }
+
+    for (const filePath of filePaths) {
+      const repo = await findGitRepo(filePath)
+      if (repo) {
+        return repo
+      }
+    }
+
+    return null
+  }
+
+  return {
+    "tool.execute.before": async (input: ToolHookInput, output?: { args?: unknown }) => {
+      try {
+        const toolName = hookString(input.tool)
+        const callID = hookString(input.callID)
+        const sessionID = hookString(input.sessionID)
+        const toolInput = output?.args ?? input.args
+        const toolCwd = extractToolCwd(input.cwd ?? input.workdir, asRecord(toolInput))
+
+        if (isEditTool(toolName)) {
+          const filePaths = extractFilePaths(toolInput, toolCwd)
+          const repoDir = await resolveRepoDir(filePaths, toolCwd)
+          if (!repoDir) {
+            return
+          }
+
+          pendingCalls.set(callID, { repoDir, sessionID, toolInput })
+
+          const hookInput = JSON.stringify({
+            hook_event_name: "PreToolUse",
+            session_id: sessionID,
+            tool_use_id: callID,
+            cwd: repoDir,
+            tool_name: toolName,
+            tool_input: toolInput,
+          })
+          await shell`echo ${hookInput} | ${GIT_AI_BIN} checkpoint opencode --hook-input stdin`.quiet()
+
+        } else if (isBashTool(toolName)) {
+          const repoDir = await resolveRepoDir([], toolCwd)
+          if (!repoDir) {
+            return
+          }
+
+          pendingCalls.set(callID, { repoDir, sessionID, toolInput })
+
+          const hookInput = JSON.stringify({
+            hook_event_name: "PreToolUse",
+            session_id: sessionID,
+            tool_use_id: callID,
+            cwd: repoDir,
+            tool_name: toolName,
+            tool_input: toolInput,
+          })
+          await shell`echo ${hookInput} | ${GIT_AI_BIN} checkpoint opencode --hook-input stdin`.quiet()
+        }
+      } catch {
+        // Checkpoint failures are non-critical — never propagate to the host
+      }
+    },
+
+    "tool.execute.after": async (input: ToolHookInput) => {
+      try {
+        const toolName = hookString(input.tool)
+        if (!isEditTool(toolName) && !isBashTool(toolName)) {
+          return
+        }
+
+        const callID = hookString(input.callID)
+        const callInfo = pendingCalls.get(callID)
+        pendingCalls.delete(callID)
+
+        if (!callInfo) {
+          return
+        }
+
+        const hookInput = JSON.stringify({
+          hook_event_name: "PostToolUse",
+          session_id: callInfo.sessionID,
+          tool_use_id: callID,
+          cwd: callInfo.repoDir,
+          tool_name: toolName,
+          tool_input: callInfo.toolInput,
+        })
+        await shell`echo ${hookInput} | ${GIT_AI_BIN} checkpoint opencode --hook-input stdin`.quiet()
+      } catch {
+        // Checkpoint failures are non-critical — never propagate to the host
+      }
+    },
+  }
+}
+
 export const GitAiPlugin: Plugin = async (ctx) => {
+  const shell = (ctx as PluginInput & { $?: unknown }).$
+  if (hasShell(shell)) {
+    return createShellHooks(shell)
+  }
+
   const { worktree, directory } = ctx
   const defaultCwd = worktree || directory || process.cwd()
 
@@ -436,13 +582,6 @@ export const GitAiPlugin: Plugin = async (ctx) => {
       input: toolInput,
       file_paths: filePaths,
     }
-  }
-
-  const extractToolCwd = (inputCwd: unknown, args: Record<string, unknown> | undefined): string | undefined => {
-    if (typeof args?.workdir === "string") return args.workdir
-    if (typeof args?.cwd === "string") return args.cwd
-    if (typeof inputCwd === "string") return inputCwd
-    return undefined
   }
 
   return {
