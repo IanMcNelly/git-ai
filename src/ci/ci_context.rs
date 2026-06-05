@@ -132,8 +132,13 @@ impl CiContext {
                     // their fork SHAs. Import only notes for those PR commits,
                     // then push the scoped local authorship ref.
                     if fork_clone_url.is_some() {
-                        let (_source_base, original_commits) =
-                            self.original_pr_commits(head_sha, base_ref, base_sha);
+                        let (_source_base, original_commits) = self
+                            .original_pr_commits_for_merge_commit(
+                                &merge_commit,
+                                head_sha,
+                                base_ref,
+                                base_sha,
+                            );
                         let fork_notes_imported = self.import_fork_notes_for_commits(
                             fork_clone_url,
                             &original_commits,
@@ -518,6 +523,35 @@ impl CiContext {
             merge_base.map(|base| format!("merge-base {}", base)),
             vec![resolved_head],
         )
+    }
+
+    fn original_pr_commits_for_merge_commit(
+        &self,
+        merge_commit: &crate::git::repository::Commit<'_>,
+        head_sha: &str,
+        base_ref: &str,
+        base_sha: &str,
+    ) -> (Option<String>, Vec<String>) {
+        if let Ok(first_parent) = merge_commit.parent(0) {
+            let first_parent_sha = first_parent.id();
+            if let Ok(mut commits) = CommitRange::new_infer_refname(
+                &self.repo,
+                first_parent_sha.clone(),
+                head_sha.to_string(),
+                None,
+            )
+            .map(|r| r.all_commits())
+                && !commits.is_empty()
+            {
+                commits.reverse();
+                return (
+                    Some(format!("merge first-parent {}", first_parent_sha)),
+                    commits,
+                );
+            }
+        }
+
+        self.original_pr_commits(head_sha, base_ref, base_sha)
     }
 
     /// Get the rebased commits by walking back from merge_commit_sha.

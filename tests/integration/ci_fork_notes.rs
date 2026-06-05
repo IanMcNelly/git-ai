@@ -236,6 +236,126 @@ fn test_ci_fork_merge_commit() {
     );
 }
 
+#[test]
+fn test_ci_fork_merge_commit_preserves_non_head_pr_notes_when_base_sha_is_post_merge() {
+    let upstream = TestRepo::new();
+    let mut file = upstream.filename("feature.js");
+
+    file.set_contents(lines!["// Original code", "function original() {}"]);
+    upstream.stage_all_and_commit("Initial commit").unwrap();
+    upstream.git(&["branch", "-M", "main"]).unwrap();
+    add_self_origin(&upstream);
+
+    let fork = TestRepo::new();
+    let upstream_path = upstream.path().to_str().unwrap().to_string();
+    fork.git_og(&["remote", "add", "upstream", &upstream_path])
+        .unwrap();
+    fork.git_og(&["fetch", "upstream"]).unwrap();
+    fork.git_og(&["checkout", "-b", "main", "upstream/main"])
+        .unwrap();
+
+    let mut fork_file = fork.filename("feature.js");
+    fork_file.set_contents(lines![
+        "// Original code",
+        "function original() {}",
+        "// AI feature from fork".ai(),
+        "function forkFeature() {".ai(),
+        "  return true;".ai(),
+        "}".ai()
+    ]);
+    let ai_commit = fork.stage_all_and_commit("Add AI feature in fork").unwrap();
+    let ai_commit_sha = ai_commit.commit_sha.clone();
+
+    fs::write(
+        fork.path().join("feature.js"),
+        "\
+// Original code
+function original() {}
+// AI feature from fork
+function forkFeature() {
+  return true;
+}
+// Human follow-up
+",
+    )
+    .unwrap();
+    fork.git_og(&["add", "-A"]).unwrap();
+    fork.git_og(&["commit", "-m", "Human follow-up in fork"])
+        .unwrap();
+    let fork_head_sha = fork
+        .git_og(&["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let fork_repo = GitAiRepository::find_repository_in_path(fork.path().to_str().unwrap())
+        .expect("Failed to find fork repository");
+    assert!(
+        get_reference_as_authorship_log_v3(&fork_repo, &ai_commit_sha).is_ok(),
+        "first fork commit should have authorship notes"
+    );
+    assert!(
+        show_authorship_note(&fork_repo, &fork_head_sha).is_none(),
+        "raw git head commit should not have an authorship note"
+    );
+
+    upstream
+        .git_og(&["remote", "add", "fork", fork.path().to_str().unwrap()])
+        .unwrap();
+    upstream
+        .git_og(&["fetch", "fork", "main:refs/fork/main"])
+        .unwrap();
+    upstream
+        .git_og(&[
+            "merge",
+            "--no-ff",
+            "refs/fork/main",
+            "-m",
+            "Merge fork PR (#2)",
+        ])
+        .unwrap();
+    let merge_sha = upstream
+        .git_og(&["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let upstream_repo = GitAiRepository::find_repository_in_path(upstream.path().to_str().unwrap())
+        .expect("Failed to find upstream repository");
+    let ci_context = CiContext::with_repository(
+        upstream_repo,
+        CiEvent::Merge {
+            merge_commit_sha: merge_sha.clone(),
+            head_ref: "main".to_string(),
+            head_sha: fork_head_sha.clone(),
+            base_ref: "main".to_string(),
+            // For merge commits, the first parent is the target-side boundary
+            // even if a caller passes a post-merge base ref/SHA.
+            base_sha: merge_sha,
+            fork_clone_url: Some(fork.path().to_str().unwrap().to_string()),
+        },
+    );
+
+    let result = ci_context.run().unwrap();
+    assert!(
+        matches!(result, CiRunResult::ForkNotesPreserved),
+        "Expected ForkNotesPreserved for fork merge commit, got {:?}",
+        result
+    );
+
+    let upstream_repo_after =
+        GitAiRepository::find_repository_in_path(upstream.path().to_str().unwrap())
+            .expect("Failed to find upstream repository");
+    assert!(
+        get_reference_as_authorship_log_v3(&upstream_repo_after, &ai_commit_sha).is_ok(),
+        "non-head PR commit authorship should be preserved"
+    );
+    assert!(
+        show_authorship_note(&upstream_repo_after, &fork_head_sha).is_none(),
+        "head commit should remain without a note"
+    );
+}
+
 /// Test that CI handles fork PRs with no notes gracefully.
 ///
 /// If a fork contributor doesn't use git-ai, there are no notes to fetch.
