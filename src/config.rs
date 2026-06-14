@@ -313,6 +313,14 @@ impl Config {
         &self,
         remotes: Option<&Vec<(String, String)>>,
     ) -> bool {
+        if remotes.is_some_and(|remotes| {
+            remotes.iter().any(|(_, remote_url)| {
+                crate::diagnostic_sentinels::is_debug_self_check_remote_url(remote_url)
+            })
+        }) {
+            return true;
+        }
+
         // First check if repository is in exclusion list - exclusions take precedence
         if !self.exclude_repositories.is_empty()
             && let Some(remotes) = remotes
@@ -344,8 +352,28 @@ impl Config {
     /// This uses a blacklist model: empty list = share everywhere, patterns = repos to exclude.
     /// Local repositories (no remotes) are only excluded if wildcard "*" pattern is present.
     pub fn should_exclude_prompts(&self, repository: &Option<Repository>) -> bool {
+        let remotes = repository
+            .as_ref()
+            .and_then(|repo| repo.remotes_with_urls().ok());
+
+        self.should_exclude_prompts_with_remotes(remotes.as_ref())
+    }
+
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn should_exclude_prompts_with_remotes(
+        &self,
+        remotes: Option<&Vec<(String, String)>>,
+    ) -> bool {
         // Empty exclusion list = never exclude
         if self.exclude_prompts_in_repositories.is_empty() {
+            return false;
+        }
+
+        if remotes.is_some_and(|remotes| {
+            remotes.iter().any(|(_, remote_url)| {
+                crate::diagnostic_sentinels::is_debug_self_check_remote_url(remote_url)
+            })
+        }) {
             return false;
         }
 
@@ -357,11 +385,6 @@ impl Config {
         if has_wildcard {
             return true;
         }
-
-        // Fetch remotes
-        let remotes = repository
-            .as_ref()
-            .and_then(|repo| repo.remotes_with_urls().ok());
 
         match remotes {
             Some(remotes) => {
@@ -1783,6 +1806,17 @@ mod tests {
 
         // Wildcard * should also exclude repos without remotes (None case)
         assert!(config.should_exclude_prompts(&None));
+    }
+
+    #[test]
+    fn test_debug_self_check_remote_bypasses_prompt_exclusion_wildcard() {
+        let config = create_test_config_with_exclude_prompts(vec!["*".to_string()]);
+        let remotes = vec![(
+            "origin".to_string(),
+            crate::diagnostic_sentinels::DEBUG_SELF_CHECK_REMOTE_URL.to_string(),
+        )];
+
+        assert!(!config.should_exclude_prompts_with_remotes(Some(&remotes)));
     }
 
     #[test]
