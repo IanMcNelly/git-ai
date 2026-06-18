@@ -31,6 +31,16 @@ DEFAULT_GIT_SHA = os.environ.get("GIT_COMPAT_SHA", "94f057755b7941b321fd11fec1b2
 DEFAULT_CLONE_DIR = Path("/tmp/git-core-tests")
 
 
+def env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+DEFAULT_CLEAN_GIT_SOURCE = env_flag("GIT_COMPAT_CLEAN_SOURCE", env_flag("GITHUB_ACTIONS", False))
+
+
 def read_tests_list(path: Path) -> List[str]:
     tests: List[str] = []
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -131,9 +141,17 @@ def ensure_origin(clone_dir: Path, clone_url: str, env: dict) -> None:
         )
 
 
-def checkout_git_ref(clone_dir: Path, git_ref: str, expected_sha: str, env: dict) -> None:
+def checkout_git_ref(clone_dir: Path, git_ref: str, expected_sha: str, clean_source: bool, env: dict) -> bool:
     if not git_ref:
-        return
+        return clean_source
+    previous_sha = subprocess.run(
+        ["git", "-C", str(clone_dir), "rev-parse", "HEAD"],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    previous_head = previous_sha.stdout.strip() if previous_sha.returncode == 0 else None
     subprocess.run(
         ["git", "-C", str(clone_dir), "fetch", "--depth", "1", "origin", git_ref],
         check=True,
@@ -156,14 +174,23 @@ def checkout_git_ref(clone_dir: Path, git_ref: str, expected_sha: str, env: dict
         check=True,
         env=env,
     )
-    subprocess.run(
-        ["git", "-C", str(clone_dir), "clean", "-ffdx"],
-        check=True,
-        env=env,
-    )
+    if clean_source:
+        subprocess.run(
+            ["git", "-C", str(clone_dir), "clean", "-ffdx"],
+            check=True,
+            env=env,
+        )
+    return clean_source or previous_head != actual_sha
 
 
-def ensure_git_clone(clone_dir: Path, clone_url: str, git_ref: str, expected_sha: str, env: dict) -> None:
+def ensure_git_clone(
+    clone_dir: Path,
+    clone_url: str,
+    git_ref: str,
+    expected_sha: str,
+    clean_source: bool,
+    env: dict,
+) -> bool:
     if clone_dir.exists() or clone_dir.is_symlink():
         if clone_dir.is_symlink():
             raise ValueError(f"Refusing to use symlinked Git source path: {clone_dir}")
@@ -177,7 +204,7 @@ def ensure_git_clone(clone_dir: Path, clone_url: str, git_ref: str, expected_sha
         cmd.extend([clone_url, str(clone_dir)])
         subprocess.run(cmd, check=True, env=env)
     ensure_origin(clone_dir, clone_url, env)
-    checkout_git_ref(clone_dir, git_ref, expected_sha, env)
+    return checkout_git_ref(clone_dir, git_ref, expected_sha, clean_source, env)
 
 
 def git_checkout_summary(clone_dir: Path, env: dict) -> Tuple[str, str]:
@@ -194,7 +221,10 @@ def git_checkout_summary(clone_dir: Path, env: dict) -> Tuple[str, str]:
     return head, description
 
 
-def ensure_git_build(clone_dir: Path, jobs: int, env: dict) -> None:
+def ensure_git_build(clone_dir: Path, jobs: int, force: bool, env: dict) -> None:
+    build_options = clone_dir / "GIT-BUILD-OPTIONS"
+    if build_options.exists() and not force:
+        return
     subprocess.run(
         [
             "make",
@@ -384,6 +414,11 @@ def main() -> int:
     parser.add_argument("--git-url", default=DEFAULT_GIT_URL)
     parser.add_argument("--git-ref", default=DEFAULT_GIT_REF)
     parser.add_argument("--git-sha", default=DEFAULT_GIT_SHA)
+    parser.add_argument(
+        "--clean-git-source",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_CLEAN_GIT_SOURCE,
+    )
     parser.add_argument("--clone-dir", type=Path, default=DEFAULT_CLONE_DIR)
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--git-ai-bin", type=Path, default=REPO_ROOT / "target" / "release" / "git-ai")
@@ -406,9 +441,16 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="git-ai-compat-home-") as isolated_home:
         env = make_isolated_env(isolated_home)
 
-        ensure_git_clone(args.clone_dir, args.git_url, args.git_ref, args.git_sha, env)
+        force_git_build = ensure_git_clone(
+            args.clone_dir,
+            args.git_url,
+            args.git_ref,
+            args.git_sha,
+            args.clean_git_source,
+            env,
+        )
         git_head, git_description = git_checkout_summary(args.clone_dir, env)
-        ensure_git_build(args.clone_dir, args.jobs, env)
+        ensure_git_build(args.clone_dir, args.jobs, force_git_build, env)
         git_tests_dir = args.clone_dir / "t"
 
         if not git_tests_dir.exists():

@@ -7,6 +7,7 @@ env:
   GIT_COMPAT_URL: https://github.com/git/git.git
   GIT_COMPAT_REF: v2.54.0
   GIT_COMPAT_SHA: 94f057755b7941b321fd11fec1b2e3ca5313a4e0
+  GIT_COMPAT_CLEAN_SOURCE: "1"
 
 on:
   pull_request:
@@ -97,9 +98,6 @@ jobs:
           git -C /tmp/git-core-tests clean -ffdx
           git -C /tmp/git-core-tests rev-parse HEAD
           git -C /tmp/git-core-tests describe --tags --always --dirty
-
-      - name: Build git source
-        run: make -C /tmp/git-core-tests -j$(nproc) NO_CURL=YesPlease NO_GETTEXT=YesPlease
 
       - name: Build git-ai
         run: cargo build --release --bin git-ai
